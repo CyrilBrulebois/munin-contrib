@@ -1,0 +1,134 @@
+#!/usr/bin/python3
+"""
+=head1 NAME
+
+Munin plugin to keep track of the remaining data volume for 1nce SIMs, through
+their API. Using the configured credentials, this plugin requests a token for
+further requests, first listing all available SIMs via the /sims endpoint, then
+querying the remaining volume via the /sims/{iccid}/quota/data endpoint.
+
+=head1 CONFIGURATION
+
+Example:
+
+    [1nce_sims_data_quota]
+    env.username you@example.org
+    env.password s3cr3t
+
+=head1 AUTHOR
+
+© 2024 Cyril Brulebois <kibi@mraw.org>
+
+=head1 LICENSE
+
+GPLv2
+
+=cut
+"""
+
+import json
+import os
+import sys
+import time
+from pathlib import Path
+
+import requests
+
+
+CATEGORY = 'cloud'
+
+DEFAULT_CACHE_DURATION = 3600
+DEFAULT_WARNING = 150
+DEFAULT_CRITICAL = 50
+
+
+def get_token():
+    """
+    All operations require a token.
+    """
+    r = requests.post('https://api.1nce.com/management-api/oauth/token',
+                      auth=(username, password),
+                      json={  "grant_type": "client_credentials"})
+    r.raise_for_status()
+    return r.json()['access_token']
+
+
+def do_config():
+    """
+    Generate the config.
+
+    This includes an initial connection to list all SIMs we know about.
+    """
+    token = get_token()
+    r = requests.get('https://api.1nce.com/management-api/v1/sims',
+                     headers={'Authorization': f'Bearer {token}'})
+    r.raise_for_status()
+    sims = r.json()
+    iccids = sorted([x['iccid'] for x in sims])
+
+    print('graph_title Remaining volume for 1nce SIMs (MB)')
+    print('graph_args --base 1000 -l 0')
+    print('graph_vlabel MB')
+    print(f'graph_category {CATEGORY}')
+    for iccid in iccids:
+        print(f'{iccid}.label {iccid}')
+        print(f'{iccid}.warning {DEFAULT_WARNING}:')
+        print(f'{iccid}.critical {DEFAULT_CRITICAL}:')
+
+
+def do_work(cache_duration: int=DEFAULT_CACHE_DURATION):
+    """
+    Query values.
+
+    FIXME: Values should be cached with a configurable timeout. While the API
+    isn't rate-limited when it comes to checking SIM status, it might not be
+    required to refresh data during each munin run.
+    """
+    token = get_token()
+
+    # Only query if we're missing a cache, or if the cache is outdated:
+    if not cache.exists() or time.time() >= cache.stat().st_mtime + cache_duration:
+        # All SIMs:
+        r = requests.get('https://api.1nce.com/management-api/v1/sims',
+                         headers={'Authorization': f'Bearer {token}'})
+        sims = r.json()
+
+        # Remaining data volume for each SIM:
+        data = {}
+        for sim in sims:
+            iccid = sim['iccid']
+            r = requests.get(f'https://api.1nce.com/management-api/v1/sims/{iccid}/quota/data',
+                             headers={'Authorization': f'Bearer {token}'})
+            r.raise_for_status()
+            data[iccid] = {
+                'volume': r.json()['volume'],
+                'extinfo': f'IMSI: {sim.get("imsi", "<none>")}',
+            }
+
+        # Atomic update:
+        cache.with_suffix('.new').write_text(json.dumps(data))
+        cache.with_suffix('.new').rename(cache)
+
+    # Trust the cache:
+    data = json.loads(cache.read_text())
+    for iccid, info in sorted(data.items()):
+        print(f'{iccid}.value {info["volume"]}')
+        print(f'{iccid}.extinfo {info["extinfo"]}')
+
+
+if __name__ == '__main__':
+    # Check configuration:
+    username = os.environ.get('username', None)
+    password = os.environ.get('password', None)
+    if not username or not password:
+        print('missing configuration, need both username and password')
+        sys.exit(1)
+
+    # Cache stuff:
+    myself = Path(__file__).name
+    cache = Path(os.environ.get('MUNIN_PLUGSTATE', '.')) / f'{myself}.db'
+
+    if len(sys.argv) > 1 and sys.argv[1] == 'config':
+        do_config()
+    else:
+        do_work()
